@@ -1,16 +1,15 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-import requests
-import os
-import io
+from fastapi.responses import JSONResponse
+import cv2
+import numpy as np
 import uuid
-from typing import List, Dict
+import os
 import aiofiles
+from pdf2image import convert_from_path
 
-app = FastAPI(title="PDF to Image Converter API")
+app = FastAPI(title="PDF → Photo + Signature Extract API")
 
-# CORS middleware setup
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,133 +18,92 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuration
-CONVERT_API_SECRET = os.getenv("CONVERT_API_SECRET", "change_me")
-TEMP_DIR = os.getenv("TEMP_DIR", "temp_files")
-OUTPUT_DIR = os.getenv("OUTPUT_DIR", "output_images")
+TEMP_DIR = "temp"
+OUT_DIR = "output"
 
 os.makedirs(TEMP_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(OUT_DIR, exist_ok=True)
 
-class PDFConverter:
-    def __init__(self, api_secret: str):
-        self.api_secret = api_secret
-        self.base_url = "https://v2.convertapi.com/convert/pdf/to/jpg"
+def extract_signature(full_image_path):
+    """ Crop bottom area → auto-detect signature """
+    img = cv2.imread(full_image_path)
 
-    async def convert_pdf_to_images(self, pdf_file: UploadFile) -> List[Dict]:
-        temp_filename = f"{uuid.uuid4()}_{pdf_file.filename}"
-        temp_path = os.path.join(TEMP_DIR, temp_filename)
+    if img is None:
+        return None
 
-        try:
-            async with aiofiles.open(temp_path, 'wb') as out_file:
-                content = await pdf_file.read()
-                await out_file.write(content)
+    h, w, c = img.shape
 
-            with open(temp_path, 'rb') as file:
-                files = {'File': (pdf_file.filename, file, 'application/pdf')}
-                params = {'Secret': self.api_secret, 'StoreFile': 'true'}
-                response = requests.post(self.base_url, params=params, files=files)
+    # Crop bottom 35% area (signature থাকে নিচে)
+    crop = img[int(h * 0.60):h, 0:w]
 
-                if response.status_code != 200:
-                    raise HTTPException(status_code=response.status_code, detail=f"Conversion failed: {response.text}")
+    # Convert to gray
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
-                result = response.json()
-                images_data = []
+    # Threshold for signature detection
+    _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
 
-                for i, file_info in enumerate(result.get('Files', [])):
-                    image_url = file_info['Url']
-                    image_name = file_info['FileName']
-                    img_response = requests.get(image_url)
-                    if img_response.status_code == 200:
-                        images_data.append({
-                            'image_id': i + 1,
-                            'image_name': image_name,
-                            'image_data': img_response.content,
-                            'image_size': len(img_response.content),
-                            'content_type': 'image/jpeg'
-                        })
-                return images_data
+    # Find contours (ink strokes)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Conversion error: {str(e)}")
+    if len(contours) == 0:
+        return None
 
-        finally:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+    # Get bounding box for all strokes
+    x_min = min([cv2.boundingRect(c)[0] for c in contours])
+    y_min = min([cv2.boundingRect(c)[1] for c in contours])
+    x_max = max([cv2.boundingRect(c)[0] + cv2.boundingRect(c)[2] for c in contours])
+    y_max = max([cv2.boundingRect(c)[1] + cv2.boundingRect(c)[3] for c in contours])
 
-converter = PDFConverter(CONVERT_API_SECRET)
+    sign_crop = crop[y_min:y_max, x_min:x_max]
 
-@app.get("/")
-async def root():
-    return {"message": "PDF to Image Converter API", "status": "running"}
+    sign_file = f"{uuid.uuid4()}_sign.jpg"
+    sign_path = os.path.join(OUT_DIR, sign_file)
+
+    cv2.imwrite(sign_path, sign_crop)
+
+    return sign_file
+
 
 @app.post("/convert-pdf")
-async def convert_pdf_to_images(pdf_file: UploadFile = File(...)):
-    if not pdf_file.filename.lower().endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+async def convert_nid(pdf_file: UploadFile = File(...)):
 
-    try:
-        images_data = await converter.convert_pdf_to_images(pdf_file)
+    if not pdf_file.filename.endswith(".pdf"):
+        raise HTTPException(400, "Only PDF allowed")
 
-        if not images_data:
-            raise HTTPException(status_code=500, detail="No images were generated from the PDF")
+    temp_path = os.path.join(TEMP_DIR, f"{uuid.uuid4()}.pdf")
 
-        response_data = {
-            "status": "success",
-            "message": f"Successfully converted PDF to {len(images_data)} images",
-            "total_images": len(images_data),
-            "images": []
-        }
+    async with aiofiles.open(temp_path, "wb") as f:
+        await f.write(await pdf_file.read())
 
-        for img_data in images_data:
-            image_id = img_data['image_id']
-            image_filename = f"{uuid.uuid4()}_{img_data['image_name']}"
-            image_path = os.path.join(OUTPUT_DIR, image_filename)
+    # Convert PDF → Image
+    pages = convert_from_path(temp_path, 300)
 
-            async with aiofiles.open(image_path, 'wb') as f:
-                await f.write(img_data['image_data'])
+    if len(pages) == 0:
+        raise HTTPException(500, "PDF conversion failed")
 
-            response_data["images"].append({
-                "image_id": image_id,
-                "image_name": img_data['image_name'],
-                "download_url": f"/download-image/{image_filename}",
-                "preview_url": f"/preview-image/{image_filename}",
-                "size_kb": round(img_data['image_size'] / 1024, 2)
-            })
+    # First page = NID front page
+    page_image = pages[0]
+    img_id = f"{uuid.uuid4()}_full.jpg"
+    full_path = os.path.join(OUT_DIR, img_id)
+    page_image.save(full_path)
 
-        return JSONResponse(content=response_data)
+    # Extract signature
+    sign_file = extract_signature(full_path)
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+    response = {
+        "status": "success",
+        "photo_image": f"/preview/{img_id}",
+        "sign_image": f"/preview/{sign_file}" if sign_file else None
+    }
 
-@app.get("/download-image/{image_filename}")
-async def download_image(image_filename: str):
-    image_path = os.path.join(OUTPUT_DIR, image_filename)
-    if not os.path.exists(image_path):
-        raise HTTPException(status_code=404, detail="Image not found")
+    return JSONResponse(response)
 
-    async def iterfile():
-        async with aiofiles.open(image_path, 'rb') as f:
-            while chunk := await f.read(1024 * 1024):
-                yield chunk
 
-    return StreamingResponse(iterfile(), media_type='image/jpeg')
+@app.get("/preview/{filename}")
+async def preview(filename):
+    path = os.path.join(OUT_DIR, filename)
 
-@app.get("/preview-image/{image_filename}")
-async def preview_image(image_filename: str):
-    image_path = os.path.join(OUTPUT_DIR, image_filename)
-    if not os.path.exists(image_path):
-        raise HTTPException(status_code=404, detail="Image not found")
+    if not os.path.exists(path):
+        raise HTTPException(404, "File not found")
 
-    async def iterfile():
-        async with aiofiles.open(image_path, 'rb') as f:
-            while chunk := await f.read(1024 * 1024):
-                yield chunk
-
-    return StreamingResponse(iterfile(), media_type='image/jpeg')
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    return FileResponse(path, media_type="image/jpeg")
