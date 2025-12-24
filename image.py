@@ -20,7 +20,7 @@ app.add_middleware(
 )
 
 # Configuration
-CONVERT_API_SECRET = "sA5vw0cFVyj4ya7u7ScpS01yW8LUAqkx"  # Replace with your actual secret
+CONVERT_API_SECRET = os.getenv("sA5vw0cFVyj4ya7u7ScpS01yW8LUAqkx")
 TEMP_DIR = "temp_files"
 OUTPUT_DIR = "output_images"
 
